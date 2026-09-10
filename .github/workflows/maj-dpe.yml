@@ -26,7 +26,10 @@ jobs:
 
       - name: Extraire les DPE et générer la carte
         run: |
-          python dpe_carte.py \
+          name: Diagnostic ADEME
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: python dpe_ademe.py --diagnostic
             --cp codes-postaux.txt \
             --depuis 2026-01-01 \
             --titre "Haute-Vienne" \
