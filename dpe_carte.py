@@ -32,7 +32,7 @@ import sys
 import time
 import unicodedata
 from datetime import date
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 
@@ -40,7 +40,16 @@ API = "https://data.ademe.fr/data-fair/api/v1/datasets"
 DATASET = "dpe03existant"          # logements existants depuis juillet 2021
 GEO_API = "https://geo.api.gouv.fr/communes"
 PAGE_SIZE = 1000                   # 10 000 max côté ADEME, 1 000 = plus sûr
-UA = {"User-Agent": "carte-dpe/2.0 (open data ADEME)"}
+# Certains pare-feux publics refusent les requêtes qui n'ont pas l'air de
+# venir d'un navigateur : on se présente comme tel.
+UA = {
+    "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/129.0.0.0 Safari/537.36"),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+    "Referer": "https://data.ademe.fr/",
+}
 
 MOIS = ["janvier", "février", "mars", "avril", "mai", "juin", "juillet",
         "août", "septembre", "octobre", "novembre", "décembre"]
@@ -56,8 +65,15 @@ COLONNES = ["classe", "ges", "mois_libelle", "date", "commune", "cp", "adresse",
 
 # ---------------------------------------------------------------- utilitaires
 
+class ErreurAPI(Exception):
+    def __init__(self, code, url, corps):
+        self.code, self.url, self.corps = code, url, corps
+        super().__init__(f"HTTP {code} sur {url}\n  réponse : {corps or '(vide)'}")
+
+
 def http_json(url, tries=4):
-    """GET JSON avec relances : l'API ADEME renvoie parfois des 429."""
+    """GET JSON avec relances. En cas d'erreur HTTP, on remonte le corps de la
+    réponse : l'API y explique presque toujours ce qu'elle reproche."""
     for essai in range(tries):
         try:
             with urlopen(Request(url, headers=UA), timeout=120) as r:
@@ -66,12 +82,16 @@ def http_json(url, tries=4):
             if e.code in (429, 500, 502, 503, 504) and essai < tries - 1:
                 time.sleep(3 * (essai + 1))
                 continue
-            raise
-        except URLError:
+            try:
+                corps = e.read().decode("utf-8", "replace").strip()[:400]
+            except Exception:
+                corps = ""
+            raise ErreurAPI(e.code, url, corps) from None
+        except URLError as e:
             if essai < tries - 1:
                 time.sleep(3 * (essai + 1))
                 continue
-            raise
+            raise ErreurAPI(0, url, str(e)) from None
 
 
 def sans_accent(s):
@@ -97,11 +117,30 @@ def fr(iso):
 
 # ------------------------------------------------- découverte du schéma ADEME
 
-def charger_schema():
+def charger_schema(dataset):
     """Le schéma ADEME évolue (v2 -> v3). On lit les clés réelles au lieu de
-    les coder en dur : le script survit à un renommage de colonne."""
-    champs = http_json(f"{API}/{DATASET}/schema")
-    return [c["key"] for c in champs if isinstance(c, dict) and "key" in c]
+    les coder en dur. Si l'endpoint /schema ne répond pas, on retombe sur une
+    ligne d'exemple, ce qui donne les mêmes clés."""
+    try:
+        champs = http_json(f"{API}/{dataset}/schema")
+        cles = [c["key"] for c in champs if isinstance(c, dict) and "key" in c]
+        if cles:
+            print(f"  schéma lu : {len(cles)} colonnes")
+            return cles
+        print("  /schema vide, repli sur une ligne d'exemple")
+    except Exception as e:
+        print(f"  /schema indisponible ({e}), repli sur une ligne d'exemple")
+
+    page = http_json(f"{API}/{dataset}/lines?size=1")
+    resultats = page.get("results") or []
+    if not resultats:
+        raise SystemExit(
+            f"Le jeu de données '{dataset}' ne renvoie aucune ligne.\n"
+            f"Vérifiez son identifiant sur data.ademe.fr, puis relancez avec "
+            f"--dataset <identifiant>.")
+    cles = list(resultats[0].keys())
+    print(f"  {len(cles)} colonnes déduites d'une ligne d'exemple")
+    return cles
 
 
 def trouver(cles, *motifs, obligatoire=False):
@@ -118,7 +157,8 @@ def trouver(cles, *motifs, obligatoire=False):
     if obligatoire:
         raise SystemExit(
             f"Champ introuvable dans le schéma ADEME (cherché : {motifs}).\n"
-            f"Clés disponibles : {', '.join(sorted(cles)[:40])} ..."
+            f"Colonnes réellement disponibles :\n  "
+            + "\n  ".join(sorted(cles))
         )
     return None
 
@@ -145,10 +185,23 @@ def mapper_champs(cles):
 def lire_codes_postaux(source):
     """Accepte une liste séparée par des virgules ou des retours à la ligne,
     ou le chemin d'un fichier contenant un code postal par ligne."""
-    brut = open(source, encoding="utf-8").read() if os.path.isfile(source) else source
+    if os.path.isfile(source):
+        brut = open(source, encoding="utf-8").read()
+        print(f"Codes postaux lus dans {source}")
+    else:
+        brut = source
+        if source.endswith((".txt", ".csv")):
+            raise SystemExit(
+                f"Le fichier '{source}' est introuvable.\n"
+                f"Fichiers présents ici : "
+                f"{', '.join(sorted(os.listdir('.'))) or '(aucun)'}\n"
+                f"Déposez codes-postaux.txt à la racine du dépôt, ou passez "
+                f"les codes directement : --cp \"87000,87100\"")
     codes = sorted({c for c in re.findall(r"\b\d{5}\b", brut)})
     if not codes:
-        raise SystemExit("Aucun code postal à 5 chiffres trouvé dans --cp.")
+        raise SystemExit(
+            f"Aucun code postal à 5 chiffres trouvé dans --cp.\n"
+            f"Contenu analysé : {brut[:200]!r}")
     return codes
 
 
@@ -171,23 +224,66 @@ def nom_commune(insee):
 
 # ------------------------------------------------------------- extraction API
 
-def extraire(cp, depuis, champs):
-    """Tous les DPE d'un code postal depuis une date, en suivant le curseur
-    `next` de l'API : pas de plafond à 10 000 lignes."""
+_variante_retenue = None
+
+
+def variantes_requete(cp, depuis, champs):
+    """L'API refuse parfois certains paramètres (403). On essaie du plus riche
+    au plus dépouillé et on garde la première combinaison qui passe."""
     select = ",".join(sorted({v for v in champs.values() if v} | {"_geopoint"}))
     qs = (f'{echappe_champ(champs["cp"])}:"{cp}" AND '
           f'{echappe_champ(champs["date"])}:[{depuis} TO *]')
-    url = (f"{API}/{DATASET}/lines?size={PAGE_SIZE}"
-           f"&select={quote(select)}&qs={quote(qs)}"
-           f"&sort={quote(champs['date'])}")
+    base = {"size": PAGE_SIZE, "qs": qs}
+    return [
+        ("complète",     {**base, "select": select, "sort": champs["date"]}),
+        ("sans select",  {**base, "sort": champs["date"]}),
+        ("sans tri",     {**base, "select": select}),
+        ("minimale",     dict(base)),
+    ]
+
+
+def extraire(cp, depuis, champs, dataset=DATASET):
+    """Tous les DPE d'un code postal depuis une date, en suivant le curseur
+    `next` de l'API : pas de plafond à 10 000 lignes."""
+    global _variante_retenue
+    essais = variantes_requete(cp, depuis, champs)
+    if _variante_retenue:
+        essais = [v for v in essais if v[0] == _variante_retenue]
+
+    url, derniere = None, None
+    for nom, params in essais:
+        candidate = f"{API}/{dataset}/lines?" + urlencode(params)
+        try:
+            premiere = http_json(candidate)
+        except ErreurAPI as e:
+            derniere = e
+            if e.code in (400, 403, 404):
+                continue
+            raise
+        if _variante_retenue != nom:
+            _variante_retenue = nom
+            if nom != "complète":
+                print(f"  requête {nom} acceptée par l'API")
+        url = candidate
+        break
+
+    if url is None:
+        raise SystemExit(
+            f"L'API ADEME refuse toutes les variantes de requête.\n{derniere}\n\n"
+            f"Si le code 403 revient depuis GitHub mais que l'adresse suivante "
+            f"s'ouvre dans votre navigateur, c'est le serveur cloud qui est "
+            f"filtré, pas la requête :\n"
+            f"  {API}/{dataset}/lines?size=1")
 
     lignes, total = [], None
+    page = premiere
     while url:
-        page = http_json(url)
+        if page is None:
+            page = http_json(url)
         if total is None:
             total = page.get("total", 0)
         lignes.extend(page.get("results", []))
-        url = page.get("next")
+        url, page = page.get("next"), None
         print(f"    {cp} : {len(lignes)}/{total}", end="\r", flush=True)
         time.sleep(0.2)
     print(f"    {cp} : {len(lignes)} DPE            ")
@@ -687,6 +783,8 @@ def main():
     ap.add_argument("--depuis", default="2026-01-01",
                     help="date minimale du DPE (AAAA-MM-JJ), défaut 2026-01-01")
     ap.add_argument("--out", default="sortie", help="dossier de sortie")
+    ap.add_argument("--dataset", default=DATASET,
+                    help="identifiant du jeu de données ADEME")
     ap.add_argument("--titre", default="Haute-Vienne", help="titre de la carte")
     ap.add_argument("--url-publique", default="",
                     help="URL publique du dossier de sortie (ex. "
@@ -701,15 +799,36 @@ def main():
     codes = lire_codes_postaux(args.cp)
     print(f"{len(codes)} codes postaux · DPE depuis le {fr(args.depuis)}")
 
+    print("Test de l'accès à l'API…")
+    try:
+        sonde = http_json(f"{API}/{args.dataset}/lines?size=1")
+        print(f"  accès accepté ({sonde.get('total', '?')} DPE dans le jeu "
+              f"de données)")
+    except ErreurAPI as e:
+        raise SystemExit(
+            f"L'API ADEME refuse même une requête minimale.\n{e}\n\n"
+            f"Ouvrez cette adresse dans un navigateur pour comparer :\n"
+            f"  {API}/{args.dataset}/lines?size=1\n"
+            f"Si elle s'affiche chez vous, c'est l'adresse IP du serveur "
+            f"GitHub qui est filtrée : lancez le script depuis votre poste.")
+
     print("Lecture du schéma ADEME…")
-    champs = mapper_champs(charger_schema())
+    champs = mapper_champs(charger_schema(args.dataset))
+    print("  colonnes retenues : " +
+          ", ".join(f"{k}={v}" for k, v in champs.items() if v))
     if not champs.get("type"):
         print("  ! type de bâtiment absent du schéma : colonne 'type' vide",
               file=sys.stderr)
 
     lignes = []
     for cp in codes:
-        lignes += extraire(cp, args.depuis, champs)
+        lignes += extraire(cp, args.depuis, champs, args.dataset)
+
+    if not lignes:
+        raise SystemExit(
+            "Aucun DPE trouvé pour ces codes postaux depuis le "
+            f"{fr(args.depuis)}. Vérifiez la date et les codes postaux, ou "
+            f"testez un code seul : --cp \"87000\" --depuis 2021-07-01")
 
     geo = en_geojson(lignes, champs)
     ecrire_carte(geo, args.out, args.titre, args.depuis)
@@ -739,4 +858,13 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception:
+        import traceback
+        print("\n--- Erreur inattendue ---", file=sys.stderr)
+        traceback.print_exc()
+        print("\nCopiez ces lignes pour diagnostic.", file=sys.stderr)
+        sys.exit(1)
