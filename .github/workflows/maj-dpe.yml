@@ -1,0 +1,42 @@
+name: Mise à jour de la carte DPE
+
+on:
+  schedule:
+    - cron: "0 5 * * *"      # tous les jours à 7h (heure de Paris, été)
+  workflow_dispatch:          # bouton "Run workflow" pour relancer à la main
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  carte:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Extraire les DPE et générer la carte
+        run: |
+          python dpe_carte.py \
+            --cp codes-postaux.txt \
+            --depuis 2026-01-01 \
+            --titre "Haute-Vienne" \
+            --url-publique "https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/" \
+            --out site
+          cp site/carte.html site/index.html
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - id: deploiement
+        uses: actions/deploy-pages@v4
