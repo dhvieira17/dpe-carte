@@ -1,870 +1,240 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-Carte des DPE par codes postaux, à partir de l'open data ADEME.
+dpe_carte.py — extrait les DPE ADEME pour une liste de codes postaux,
+écrit un CSV et génère une carte HTML autonome (Leaflet, aucun dépendance
+Python supplémentaire : le rendu se fait côté navigateur via CDN).
 
-Source : https://data.ademe.fr  (jeu de données "dpe03existant" = logements
-existants, DPE établis depuis le 1er juillet 2021). Licence Ouverte 2.0.
-Mise à jour quotidienne côté ADEME.
-
-Usage :
-    python dpe_carte.py --cp codes-postaux.txt --depuis 2026-01-01 \
-                        --url-publique https://moncompte.github.io/dpe/
-
-Produit dans le dossier de sortie :
-    carte.html + data.js         carte autonome, ouvrable en double-clic
-    dpe.geojson                  tous les points
-    commune-<nom>.geojson        une couche uMap par commune
-    type-maison.geojson, etc.    une couche uMap par type de bien
-    carte.umap                   carte uMap préconfigurée (--url-publique)
-    dpe.csv                      tout l'extrait, pour Excel
-    google-my-maps/*.csv         un fichier par commune, découpé à 2 000 lignes
-
-Aucune clé d'API n'est nécessaire.
+    python dpe_carte.py --diagnostic
+    python dpe_carte.py
+    python dpe_carte.py --codes codes-postaux.txt --depuis 2026-01-01
 """
+
+from __future__ import annotations
 
 import argparse
-import csv
 import json
-import os
-import re
+import logging
 import sys
-import time
-import unicodedata
 from datetime import date
-from urllib.parse import quote, urlencode
-from urllib.request import Request, urlopen
-from urllib.error import HTTPError, URLError
+from typing import Any, Dict, List, Optional, Tuple
 
-API = "https://data.ademe.fr/data-fair/api/v1/datasets"
-DATASET = "dpe03existant"          # logements existants depuis juillet 2021
-GEO_API = "https://geo.api.gouv.fr/communes"
-PAGE_SIZE = 1000                   # 10 000 max côté ADEME, 1 000 = plus sûr
-# Certains pare-feux publics refusent les requêtes qui n'ont pas l'air de
-# venir d'un navigateur : on se présente comme tel.
-UA = {
-    "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                   "AppleWebKit/537.36 (KHTML, like Gecko) "
-                   "Chrome/129.0.0.0 Safari/537.36"),
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
-    "Referer": "https://data.ademe.fr/",
+from dpe_ademe import CHAMPS, ClientDPE, charger_codes_postaux, ecrire_csv
+
+log = logging.getLogger("dpe_carte")
+
+COULEURS = {
+    "A": "#319834", "B": "#33cc31", "C": "#cbfc34", "D": "#fff32a",
+    "E": "#fdd21c", "F": "#f3ac1c", "G": "#ec0000",
 }
 
-MOIS = ["janvier", "février", "mars", "avril", "mai", "juin", "juillet",
-        "août", "septembre", "octobre", "novembre", "décembre"]
 
-COULEURS = {"A": "#2f9e41", "B": "#5bc353", "C": "#a8d24a", "D": "#f2e14a",
-            "E": "#f0b53f", "F": "#e8853a", "G": "#d94436", "?": "#9aa0a6"}
-
-MYMAPS_MAX = 2000                  # limite d'un calque Google My Maps
-
-COLONNES = ["classe", "ges", "mois_libelle", "date", "commune", "cp", "adresse",
-            "type", "surface", "annee", "conso", "num", "lat", "lon"]
-
-
-# ---------------------------------------------------------------- utilitaires
-
-class ErreurAPI(Exception):
-    def __init__(self, code, url, corps):
-        self.code, self.url, self.corps = code, url, corps
-        super().__init__(f"HTTP {code} sur {url}\n  réponse : {corps or '(vide)'}")
-
-
-def http_json(url, tries=4):
-    """GET JSON avec relances. En cas d'erreur HTTP, on remonte le corps de la
-    réponse : l'API y explique presque toujours ce qu'elle reproche."""
-    for essai in range(tries):
+def coordonnees(ligne: Dict[str, Any]) -> Optional[Tuple[float, float]]:
+    gp = ligne.get("_geopoint")
+    if isinstance(gp, str) and "," in gp:
         try:
-            with urlopen(Request(url, headers=UA), timeout=120) as r:
-                return json.loads(r.read().decode("utf-8"))
-        except HTTPError as e:
-            if e.code in (429, 500, 502, 503, 504) and essai < tries - 1:
-                time.sleep(3 * (essai + 1))
-                continue
-            try:
-                corps = e.read().decode("utf-8", "replace").strip()[:400]
-            except Exception:
-                corps = ""
-            raise ErreurAPI(e.code, url, corps) from None
-        except URLError as e:
-            if essai < tries - 1:
-                time.sleep(3 * (essai + 1))
-                continue
-            raise ErreurAPI(0, url, str(e)) from None
-
-
-def sans_accent(s):
-    s = unicodedata.normalize("NFD", str(s))
-    s = "".join(c for c in s if unicodedata.category(c) != "Mn")
-    return re.sub(r"[^a-z0-9]", "", s.lower())
-
-
-def slug(s):
-    s = unicodedata.normalize("NFD", str(s))
-    s = "".join(c for c in s if unicodedata.category(c) != "Mn")
-    return re.sub(r"-+", "-", re.sub(r"[^a-z0-9]+", "-", s.lower())).strip("-")
-
-
-def echappe_champ(cle):
-    """Échappe un nom de champ pour la syntaxe query_string d'Elasticsearch."""
-    return re.sub(r'([+\-=&|><!(){}\[\]^"~*?:\\/ ])', r"\\\1", cle)
-
-
-def fr(iso):
-    return "/".join(reversed(iso.split("-")))
-
-
-# ------------------------------------------------- découverte du schéma ADEME
-
-def charger_schema(dataset):
-    """Le schéma ADEME évolue (v2 -> v3). On lit les clés réelles au lieu de
-    les coder en dur. Si l'endpoint /schema ne répond pas, on retombe sur une
-    ligne d'exemple, ce qui donne les mêmes clés."""
+            lat, lon = gp.split(",", 1)
+            return float(lat), float(lon)
+        except ValueError:
+            pass
+    lat, lon = ligne.get("latitude"), ligne.get("longitude")
     try:
-        champs = http_json(f"{API}/{dataset}/schema")
-        cles = [c["key"] for c in champs if isinstance(c, dict) and "key" in c]
-        if cles:
-            print(f"  schéma lu : {len(cles)} colonnes")
-            return cles
-        print("  /schema vide, repli sur une ligne d'exemple")
-    except Exception as e:
-        print(f"  /schema indisponible ({e}), repli sur une ligne d'exemple")
-
-    page = http_json(f"{API}/{dataset}/lines?size=1")
-    resultats = page.get("results") or []
-    if not resultats:
-        raise SystemExit(
-            f"Le jeu de données '{dataset}' ne renvoie aucune ligne.\n"
-            f"Vérifiez son identifiant sur data.ademe.fr, puis relancez avec "
-            f"--dataset <identifiant>.")
-    cles = list(resultats[0].keys())
-    print(f"  {len(cles)} colonnes déduites d'une ligne d'exemple")
-    return cles
-
-
-def trouver(cles, *motifs, obligatoire=False):
-    """Première clé dont le nom normalisé vaut, puis contient, un des motifs."""
-    index = {c: sans_accent(c) for c in cles}
-    for motif in motifs:
-        m = sans_accent(motif)
-        for cle, norm in index.items():
-            if norm == m:
-                return cle
-        for cle, norm in index.items():
-            if m in norm:
-                return cle
-    if obligatoire:
-        raise SystemExit(
-            f"Champ introuvable dans le schéma ADEME (cherché : {motifs}).\n"
-            f"Colonnes réellement disponibles :\n  "
-            + "\n  ".join(sorted(cles))
-        )
+        if lat is not None and lon is not None:
+            return float(lat), float(lon)
+    except (TypeError, ValueError):
+        pass
     return None
 
 
-def mapper_champs(cles):
-    return {
-        "cp":      trouver(cles, "code_postal_ban", "code_postal", obligatoire=True),
-        "date":    trouver(cles, "date_etablissement_dpe", "date_etablissement", obligatoire=True),
-        "classe":  trouver(cles, "etiquette_dpe", obligatoire=True),
-        "commune": trouver(cles, "nom_commune_ban", "nom_commune", "commune_ban"),
-        "insee":   trouver(cles, "code_insee_ban", "code_insee"),
-        "type":    trouver(cles, "type_batiment"),
-        "ges":     trouver(cles, "etiquette_ges"),
-        "adresse": trouver(cles, "adresse_ban", "adresse_brute", "adresse"),
-        "surface": trouver(cles, "surface_habitable_logement", "surface_habitable"),
-        "annee":   trouver(cles, "annee_construction", "periode_construction"),
-        "conso":   trouver(cles, "conso_5_usages_par_m2_ep", "consommation_energie"),
-        "num":     trouver(cles, "numero_dpe", "n_dpe"),
-    }
-
-
-# ------------------------------------------------------------- codes postaux
-
-def lire_codes_postaux(source):
-    """Accepte une liste séparée par des virgules ou des retours à la ligne,
-    ou le chemin d'un fichier contenant un code postal par ligne."""
-    if os.path.isfile(source):
-        brut = open(source, encoding="utf-8").read()
-        print(f"Codes postaux lus dans {source}")
-    else:
-        brut = source
-        if source.endswith((".txt", ".csv")):
-            raise SystemExit(
-                f"Le fichier '{source}' est introuvable.\n"
-                f"Fichiers présents ici : "
-                f"{', '.join(sorted(os.listdir('.'))) or '(aucun)'}\n"
-                f"Déposez codes-postaux.txt à la racine du dépôt, ou passez "
-                f"les codes directement : --cp \"87000,87100\"")
-    codes = sorted({c for c in re.findall(r"\b\d{5}\b", brut)})
-    if not codes:
-        raise SystemExit(
-            f"Aucun code postal à 5 chiffres trouvé dans --cp.\n"
-            f"Contenu analysé : {brut[:200]!r}")
-    return codes
-
-
-_cache_communes = {}
-
-
-def nom_commune(insee):
-    """Code INSEE -> nom de commune, via l'API Géo de l'État (mis en cache)."""
-    if not insee:
-        return None
-    insee = str(insee).strip()
-    if insee not in _cache_communes:
-        try:
-            _cache_communes[insee] = http_json(
-                f"{GEO_API}/{quote(insee)}?fields=nom").get("nom")
-        except Exception:
-            _cache_communes[insee] = None
-    return _cache_communes[insee]
-
-
-# ------------------------------------------------------------- extraction API
-
-_variante_retenue = None
-
-
-def variantes_requete(cp, depuis, champs):
-    """L'API refuse parfois certains paramètres (403). On essaie du plus riche
-    au plus dépouillé et on garde la première combinaison qui passe."""
-    select = ",".join(sorted({v for v in champs.values() if v} | {"_geopoint"}))
-    qs = (f'{echappe_champ(champs["cp"])}:"{cp}" AND '
-          f'{echappe_champ(champs["date"])}:[{depuis} TO *]')
-    base = {"size": PAGE_SIZE, "qs": qs}
-    return [
-        ("complète",     {**base, "select": select, "sort": champs["date"]}),
-        ("sans select",  {**base, "sort": champs["date"]}),
-        ("sans tri",     {**base, "select": select}),
-        ("minimale",     dict(base)),
-    ]
-
-
-def extraire(cp, depuis, champs, dataset=DATASET):
-    """Tous les DPE d'un code postal depuis une date, en suivant le curseur
-    `next` de l'API : pas de plafond à 10 000 lignes."""
-    global _variante_retenue
-    essais = variantes_requete(cp, depuis, champs)
-    if _variante_retenue:
-        essais = [v for v in essais if v[0] == _variante_retenue]
-
-    url, derniere = None, None
-    for nom, params in essais:
-        candidate = f"{API}/{dataset}/lines?" + urlencode(params)
-        try:
-            premiere = http_json(candidate)
-        except ErreurAPI as e:
-            derniere = e
-            if e.code in (400, 403, 404):
-                continue
-            raise
-        if _variante_retenue != nom:
-            _variante_retenue = nom
-            if nom != "complète":
-                print(f"  requête {nom} acceptée par l'API")
-        url = candidate
-        break
-
-    if url is None:
-        raise SystemExit(
-            f"L'API ADEME refuse toutes les variantes de requête.\n{derniere}\n\n"
-            f"Si le code 403 revient depuis GitHub mais que l'adresse suivante "
-            f"s'ouvre dans votre navigateur, c'est le serveur cloud qui est "
-            f"filtré, pas la requête :\n"
-            f"  {API}/{dataset}/lines?size=1")
-
-    lignes, total = [], None
-    page = premiere
-    while url:
-        if page is None:
-            page = http_json(url)
-        if total is None:
-            total = page.get("total", 0)
-        lignes.extend(page.get("results", []))
-        url, page = page.get("next"), None
-        print(f"    {cp} : {len(lignes)}/{total}", end="\r", flush=True)
-        time.sleep(0.2)
-    print(f"    {cp} : {len(lignes)} DPE            ")
-    return lignes
-
-
-# ------------------------------------------------------------- normalisation
-
-def normaliser_type(brut):
-    if not brut:
-        return "Non renseigné"
-    t = sans_accent(brut)
-    if "appartement" in t:
-        return "Appartement"
-    if "maison" in t:
-        return "Maison"
-    if "immeuble" in t:
-        return "Immeuble"
-    return "Autre"
-
-
-def en_geojson(lignes, champs):
-    features, sans_geo = [], 0
+def preparer_points(lignes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    points, sans_geo = [], 0
     for l in lignes:
-        pt = l.get("_geopoint")
-        if not pt:
+        xy = coordonnees(l)
+        if not xy:
             sans_geo += 1
             continue
-        try:
-            lat, lon = (float(x) for x in str(pt).split(","))
-        except ValueError:
-            sans_geo += 1
-            continue
-
-        d = str(l.get(champs["date"], ""))[:10]
-        if len(d) < 7:
-            continue
-        an, mo = d[:4], d[5:7]
-
-        commune = (l.get(champs["commune"]) if champs.get("commune") else None) \
-            or nom_commune(l.get(champs["insee"]) if champs.get("insee") else None) \
-            or "Commune inconnue"
-
-        classe = (l.get(champs["classe"]) or "?").strip().upper()[:1] or "?"
-        props = {
-            "classe": classe,
-            "date": d,
-            "mois": f"{an}-{mo}",
-            "mois_libelle": f"{MOIS[int(mo) - 1]} {an}",
-            "commune": joli_nom(commune),
-            "cp": str(l.get(champs["cp"], "")).strip(),
-            "type": normaliser_type(l.get(champs["type"]) if champs.get("type") else None),
-        }
-        for cle in ("ges", "adresse", "surface", "annee", "conso", "num"):
-            if champs.get(cle) and l.get(champs[cle]) not in (None, ""):
-                v = l[champs[cle]]
-                props[cle] = round(v, 1) if isinstance(v, float) else v
-
-        # style porté par le point lui-même : uMap le lit, ce qui permet
-        # d'organiser les couches par commune sans perdre la couleur DPE
-        props["_umap_options"] = {
-            "color": COULEURS.get(classe, COULEURS["?"]),
-            "fillColor": COULEURS.get(classe, COULEURS["?"]),
-            "fillOpacity": 0.9, "weight": 1, "radius": 6,
-            "iconClass": "Circle",
-        }
-
-        features.append({
-            "type": "Feature",
-            "geometry": {"type": "Point", "coordinates": [round(lon, 6), round(lat, 6)]},
-            "properties": props,
-        })
+        classe = (l.get(CHAMPS["classe"]) or "").strip().upper()[:1]
+        points.append(
+            {
+                "lat": round(xy[0], 6),
+                "lon": round(xy[1], 6),
+                "c": classe,
+                "g": (l.get(CHAMPS["ges"]) or "").strip().upper()[:1],
+                "a": l.get(CHAMPS["adresse"]) or "",
+                "v": l.get(CHAMPS["commune"]) or "",
+                "cp": l.get(CHAMPS["cp"]) or "",
+                "d": (l.get(CHAMPS["date"]) or "")[:10],
+                "s": l.get(CHAMPS["surface"]),
+                "t": l.get(CHAMPS["type"]) or "",
+                "an": l.get(CHAMPS["annee"]),
+                "co": l.get(CHAMPS["conso"]),
+                "n": l.get(CHAMPS["num"]) or "",
+            }
+        )
     if sans_geo:
-        print(f"  {sans_geo} DPE écartés (adresse non géocodée par la BAN)")
-    return {"type": "FeatureCollection", "features": features}
+        log.warning("%s DPE sans coordonnées, absents de la carte", sans_geo)
+    return points
 
 
-MOTS_MINUSCULES = {"la", "le", "les", "de", "des", "du", "d", "l", "sur",
-                   "sous", "en", "et", "aux", "au", "lès"}
-
-
-def joli_nom(nom):
-    """LA GENEYTOUSE -> La Geneytouse ; SAINT-YRIEIX-LA-PERCHE ->
-    Saint-Yrieix-la-Perche. Les petits mots restent en minuscules, sauf en
-    tête de nom."""
-    def morceau(m, premier):
-        return m if (not premier and m in MOTS_MINUSCULES) else m.capitalize()
-
-    sortie, premier = [], True
-    for bloc in re.split(r"([ \-'])", str(nom).strip().lower()):
-        if bloc in (" ", "-", "'"):
-            sortie.append(bloc)
-        elif bloc:
-            sortie.append(morceau(bloc, premier))
-            premier = False
-    return "".join(sortie)
-
-
-def grouper(features, cle):
-    groupes = {}
-    for f in features:
-        groupes.setdefault(f["properties"][cle], []).append(f)
-    return groupes
-
-
-# ------------------------------------------------------------------- sorties
-
-def en_lignes(features):
-    for feat in features:
-        ligne = {k: v for k, v in feat["properties"].items() if k != "_umap_options"}
-        ligne["lon"], ligne["lat"] = feat["geometry"]["coordinates"]
-        yield ligne
-
-
-def ecrire_csv(features, chemin, delimiteur=";"):
-    if not features:
-        return
-    with open(chemin, "w", newline="", encoding="utf-8-sig") as f:
-        w = csv.DictWriter(f, fieldnames=COLONNES, extrasaction="ignore",
-                           delimiter=delimiteur)
-        w.writeheader()
-        for ligne in en_lignes(features):
-            w.writerow(ligne)
-
-
-def ecrire_geojson(features, chemin):
-    with open(chemin, "w", encoding="utf-8") as f:
-        json.dump({"type": "FeatureCollection", "features": features},
-                  f, ensure_ascii=False, separators=(",", ":"))
-
-
-def ecrire_mymaps(geo, dossier):
-    """Un CSV par commune, découpé à 2 000 lignes : chaque fichier s'importe
-    tel quel comme un calque Google My Maps."""
-    cible = os.path.join(dossier, "google-my-maps")
-    os.makedirs(cible, exist_ok=True)
-    fichiers = []
-    for commune, lot in sorted(grouper(geo["features"], "commune").items()):
-        morceaux = [lot[i:i + MYMAPS_MAX] for i in range(0, len(lot), MYMAPS_MAX)]
-        for i, morceau in enumerate(morceaux, 1):
-            suffixe = f"_{i}" if len(morceaux) > 1 else ""
-            chemin = os.path.join(cible, f"{slug(commune)}{suffixe}.csv")
-            ecrire_csv(morceau, chemin, delimiteur=",")
-            fichiers.append((os.path.basename(chemin), len(morceau)))
-    return fichiers
-
-
-# -------------------------------------------------------------- couches uMap
-
-def ecrire_couches_umap(geo, dossier, url_publique, depuis, titre):
-    """Un GeoJSON par commune et par type de bien, plus un .umap préconfiguré :
-    une couche par commune, les couleurs venant des points eux-mêmes."""
-    communes = grouper(geo["features"], "commune")
-    for commune, lot in communes.items():
-        ecrire_geojson(lot, os.path.join(dossier, f"commune-{slug(commune)}.geojson"))
-    for typ, lot in grouper(geo["features"], "type").items():
-        ecrire_geojson(lot, os.path.join(dossier, f"type-{slug(typ)}.geojson"))
-
-    if not url_publique:
-        return None
-    base = url_publique.rstrip("/") + "/"
-
-    pts = [f["geometry"]["coordinates"] for f in geo["features"]]
-    centre = ([round(sum(p[0] for p in pts) / len(pts), 5),
-               round(sum(p[1] for p in pts) / len(pts), 5)]
-              if pts else [1.2611, 45.8336])
-
-    gabarit_popup = ("# {adresse}\n"
-                     "**Classe {classe}** · {type} · {surface} m²\n\n"
-                     "DPE de {mois_libelle} · {commune} {cp}")
-
-    couches = []
-    for commune in sorted(communes, key=lambda c: -len(communes[c])):
-        couches.append({
-            "type": "FeatureCollection",
-            "features": [],
-            "_umap_options": {
-                "name": f"{commune} ({len(communes[commune])})",
-                "displayOnLoad": True,
-                "browsable": True,
-                "iconClass": "Circle",
-                "popupShape": "Default",
-                "popupTemplate": "Default",
-                "popupContentTemplate": gabarit_popup,
-                "remoteData": {
-                    "url": f"{base}commune-{slug(commune)}.geojson",
-                    "format": "geojson",
-                    "licence": "ADEME — Licence Ouverte 2.0",
-                    "proxy": True,
-                    "ttl": 86400,      # relit la source une fois par jour
-                },
-            },
-        })
-
-    umap = {
-        "type": "umap",
-        "uri": "",
-        "properties": {
-            "name": f"DPE {titre} — depuis le {fr(depuis)}",
-            "description": ("Diagnostics de performance énergétique déposés à "
-                            f"l'ADEME depuis le {fr(depuis)}. Une couche par "
-                            "commune, couleur selon la classe énergie. "
-                            "Source : data.ademe.fr, Licence Ouverte 2.0."),
-            "zoom": 11,
-            "licence": "",
-            "displayPopupFooter": False,
-            "captionBar": True,
-            "onLoadPanel": "datafilters",
-            "facetKey": ("classe|Classe énergie|checkbox,"
-                         "type|Type de bien|checkbox,"
-                         "mois_libelle|Mois du DPE|checkbox,"
-                         "commune|Commune|checkbox"),
-            "datalayersControl": True,
-            "scaleControl": True,
-            "zoomControl": True,
-            "moreControl": True,
-            "miniMap": False,
-            "easing": False,
-            "tilelayer": {
-                "name": "OSM France",
-                "url_template": "https://{s}.tile.openstreetmap.fr/osmfr/{z}/{x}/{y}.png",
-                "attribution": "© OpenStreetMap France | DPE : ADEME",
-                "minZoom": 0, "maxZoom": 20,
-            },
-        },
-        "geometry": {"type": "Point", "coordinates": centre},
-        "layers": couches,
-    }
-    chemin = os.path.join(dossier, "carte.umap")
-    with open(chemin, "w", encoding="utf-8") as fh:
-        json.dump(umap, fh, ensure_ascii=False, indent=1)
-    return chemin
-
-
-# ---------------------------------------------------------------- carte HTML
-
-GABARIT = r"""<!DOCTYPE html>
+GABARIT = """<!DOCTYPE html>
 <html lang="fr">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>DPE — __TITRE__</title>
+<title>__TITRE__</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css">
+<link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css">
 <style>
-  :root{--encre:#1c1b19;--papier:#faf9f6;--trait:#d9d5cc;--gris:#6c675e}
-  *{box-sizing:border-box}
-  html,body{margin:0;height:100%;font-family:"Inter","Segoe UI",system-ui,sans-serif;color:var(--encre)}
-  #app{display:flex;height:100%}
-  #panneau{width:320px;flex:none;background:var(--papier);border-right:1px solid var(--trait);
-           overflow-y:auto;padding:20px 18px 28px}
-  #carte{flex:1}
-  h1{font-size:19px;line-height:1.25;margin:0 0 2px;font-weight:650;letter-spacing:-.01em}
-  .sous{font-size:12.5px;color:var(--gris);margin:0 0 20px;line-height:1.45}
-  .bloc{margin-bottom:20px}
-  .bloc h2{font-size:12px;font-weight:600;color:var(--gris);margin:0 0 9px}
-  .echelle{display:flex;flex-direction:column;gap:3px}
-  .barre{display:flex;align-items:center;gap:8px;border:0;background:none;padding:0;
-         cursor:pointer;font:inherit;text-align:left;width:100%}
-  .barre .jauge{height:23px;border-radius:2px 9px 9px 2px;display:flex;align-items:center;
-                padding:0 9px;color:#1c1b19;font-weight:700;font-size:12.5px;
-                transition:opacity .12s, filter .12s}
-  .barre .nb{font-size:12px;color:var(--gris);font-variant-numeric:tabular-nums}
-  .barre[aria-pressed="false"] .jauge{opacity:.22;filter:grayscale(1)}
-  .barre:focus-visible{outline:2px solid var(--encre);outline-offset:2px}
-  .chiffre{font-size:34px;font-weight:680;letter-spacing:-.03em;line-height:1}
-  .chiffre span{font-size:13px;font-weight:500;color:var(--gris);letter-spacing:0}
-  label.champ{display:block;font-size:12px;color:var(--gris);margin:0 0 5px}
-  select,input[type=search]{width:100%;padding:7px 9px;border:1px solid var(--trait);
-    border-radius:5px;font:inherit;font-size:13px;background:#fff}
-  select[multiple]{height:132px;padding:4px}
-  .duo{display:flex;gap:10px}.duo>div{flex:1;min-width:0}
-  .raz{border:0;background:none;color:var(--gris);font:inherit;font-size:12px;
-       text-decoration:underline;cursor:pointer;padding:0}
-  .pied{font-size:11px;color:#8a857b;line-height:1.5;border-top:1px solid var(--trait);padding-top:12px}
-  .popup{font-size:13px;line-height:1.5;min-width:200px}
-  .popup .cl{display:inline-block;width:22px;height:22px;border-radius:4px;color:#1c1b19;
-             font-weight:700;text-align:center;line-height:22px;margin-right:6px}
-  .popup dt{color:var(--gris);font-size:11.5px}
-  .popup dl{margin:8px 0 0;display:grid;grid-template-columns:auto 1fr;gap:2px 10px}
-  .popup dd{margin:0}
-  @media (max-width:760px){#app{flex-direction:column}#panneau{width:auto;max-height:48%;
-    border-right:0;border-bottom:1px solid var(--trait)}}
-  @media (prefers-reduced-motion:reduce){*{transition:none!important}}
+  html,body{margin:0;height:100%;font-family:system-ui,-apple-system,"Segoe UI",sans-serif}
+  #carte{height:100%}
+  .panneau{position:absolute;top:12px;right:12px;z-index:1000;background:#fff;
+    padding:12px 14px;border-radius:10px;box-shadow:0 2px 12px rgba(0,0,0,.18);
+    font-size:13px;max-width:230px}
+  .panneau h1{font-size:14px;margin:0 0 6px}
+  .panneau .meta{color:#666;font-size:12px;margin-bottom:10px}
+  .filtres{display:flex;flex-wrap:wrap;gap:5px}
+  .filtres button{border:1px solid #ddd;border-radius:6px;width:30px;height:30px;
+    font-weight:700;cursor:pointer;color:#222}
+  .filtres button.off{opacity:.28}
+  .popup b{font-size:13px}
+  .popup table{border-collapse:collapse;margin-top:6px;font-size:12px}
+  .popup td{padding:1px 8px 1px 0;vertical-align:top}
+  .pastille{display:inline-block;width:20px;height:20px;line-height:20px;
+    text-align:center;border-radius:4px;font-weight:700;color:#000}
 </style>
 </head>
 <body>
-<div id="app">
-  <div id="panneau">
-    <h1>DPE — __TITRE__</h1>
-    <p class="sous">Diagnostics déposés à l'ADEME depuis le __DEPUIS__. Extraction du __EXTRAIT__.</p>
-
-    <div class="bloc">
-      <div class="chiffre" id="total">—</div>
-      <div class="sous" style="margin:4px 0 0">diagnostics affichés · <b id="pct">—</b> en F ou G</div>
-    </div>
-
-    <div class="bloc">
-      <h2>Classes énergie — cliquer pour filtrer</h2>
-      <div class="echelle" id="echelle"></div>
-    </div>
-
-    <div class="bloc duo">
-      <div>
-        <label class="champ" for="type">Type de bien</label>
-        <select id="type"></select>
-      </div>
-      <div>
-        <label class="champ" for="mois">Mois du DPE</label>
-        <select id="mois"></select>
-      </div>
-    </div>
-
-    <div class="bloc">
-      <label class="champ" for="communes">Communes</label>
-      <select id="communes" multiple></select>
-    </div>
-
-    <div class="bloc">
-      <label class="champ" for="recherche">Rechercher une adresse ou une rue</label>
-      <input type="search" id="recherche" placeholder="ex. avenue Garibaldi" autocomplete="off">
-    </div>
-
-    <div class="bloc"><button class="raz" id="raz">Réinitialiser les filtres</button></div>
-
-    <p class="pied">Données ADEME (observatoire DPE), licence ouverte 2.0. Un DPE
-    n'existe que si le logement a été vendu, loué ou construit : la base ne couvre
-    pas tout le parc. Position issue du géocodage BAN, approximative sur certaines
-    adresses.</p>
-  </div>
-  <div id="carte"></div>
+<div id="carte"></div>
+<div class="panneau">
+  <h1>__TITRE__</h1>
+  <div class="meta">__META__</div>
+  <div class="filtres" id="filtres"></div>
 </div>
-
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
-<script src="data.js"></script>
 <script>
-const CLASSES = ["A","B","C","D","E","F","G"];
-const COULEUR = __COULEURS__;
-const points = (window.DPE_DATA && window.DPE_DATA.features) || [];
-const actives = new Set(CLASSES.concat(["?"]));
-
-const carte = L.map("carte").setView([45.83,1.26],10);
-L.tileLayer("https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
-  {maxZoom:19, attribution:'&copy; OpenStreetMap, &copy; CARTO — DPE : ADEME'}).addTo(carte);
-
-const groupe = L.markerClusterGroup({
-  maxClusterRadius: 48,
-  iconCreateFunction(c){
-    const enfants = c.getAllChildMarkers(), n = enfants.length;
-    const pires = enfants.filter(m => "FG".includes(m._p.classe)).length;
-    const part = n ? pires/n : 0;
-    const teinte = part > .5 ? "#d94436" : part > .2 ? "#e8853a" : "#4a5a6a";
-    return L.divIcon({
-      html:`<div style="background:${teinte};color:#fff;width:36px;height:36px;
-            border-radius:50%;display:flex;align-items:center;justify-content:center;
-            font:600 12px/1 Inter,sans-serif;box-shadow:0 0 0 4px ${teinte}33">${n}</div>`,
-      className:"", iconSize:[36,36]});
-  }
+const POINTS = __DONNEES__;
+const COULEURS = __COULEURS__;
+const carte = L.map('carte');
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  maxZoom: 19, attribution: '© OpenStreetMap — données ADEME'
 }).addTo(carte);
 
-function popup(p){
-  const l = [["Type", p.type]];
-  if (p.surface) l.push(["Surface", p.surface + " m²"]);
-  if (p.annee) l.push(["Construction", p.annee]);
-  if (p.conso) l.push(["Consommation", p.conso + " kWh/m²/an"]);
-  if (p.ges) l.push(["GES", p.ges]);
-  l.push(["DPE réalisé en", p.mois_libelle]);
-  l.push(["Commune", p.commune + " " + p.cp]);
-  return `<div class="popup">
-    <span class="cl" style="background:${COULEUR[p.classe]||COULEUR['?']}">${p.classe}</span>
-    <b>${p.adresse || p.commune}</b>
-    <dl>${l.map(([k,v])=>`<dt>${k}</dt><dd>${v}</dd>`).join("")}</dl></div>`;
+const actifs = new Set(Object.keys(COULEURS).concat(['']));
+const groupe = L.markerClusterGroup({ maxClusterRadius: 45, disableClusteringAtZoom: 17 });
+
+function contenu(p) {
+  const l = [];
+  if (p.t) l.push(['Type', p.t]);
+  if (p.s) l.push(['Surface', p.s + ' m²']);
+  if (p.an) l.push(['Construction', p.an]);
+  if (p.co) l.push(['Conso', Math.round(p.co) + ' kWh/m²/an']);
+  if (p.g) l.push(['GES', p.g]);
+  if (p.d) l.push(['DPE du', p.d.split('-').reverse().join('/')]);
+  if (p.n) l.push(['N°', p.n]);
+  return '<div class="popup"><b>' + (p.a || 'Adresse inconnue') + '</b><br>'
+    + p.cp + ' ' + p.v + '<br>'
+    + '<span class="pastille" style="background:' + (COULEURS[p.c] || '#bbb') + '">'
+    + (p.c || '?') + '</span>'
+    + '<table>' + l.map(x => '<tr><td>' + x[0] + '</td><td>' + x[1] + '</td></tr>').join('')
+    + '</table></div>';
 }
 
-const marqueurs = points.map(f => {
-  const p = f.properties, c = f.geometry.coordinates;
-  const m = L.circleMarker([c[1],c[0]], {
-    radius:6, weight:1.2, color:"#ffffff", opacity:.9,
-    fillColor: COULEUR[p.classe] || COULEUR["?"], fillOpacity:.92
-  });
-  m.bindPopup(() => popup(p));
-  m._p = p;
-  return m;
-});
-
-const uniques = (cle) => [...new Set(points.map(f => f.properties[cle]))].sort();
-const selType = document.getElementById("type");
-const selMois = document.getElementById("mois");
-const selCom  = document.getElementById("communes");
-
-selType.add(new Option("Tous", ""));
-uniques("type").forEach(t => selType.add(new Option(t, t)));
-
-selMois.add(new Option("Tous les mois", ""));
-[...new Set(points.map(f => f.properties.mois))].sort().reverse().forEach(m =>
-  selMois.add(new Option(points.find(f => f.properties.mois === m).properties.mois_libelle, m)));
-
-uniques("commune").forEach(c => {
-  const o = new Option(c, c); o.selected = true; selCom.add(o);
-});
-
-function communesChoisies(){
-  const v = [...selCom.selectedOptions].map(o => o.value);
-  return new Set(v.length ? v : uniques("commune"));
-}
-
-function retenus(ignorerClasse){
-  const q = document.getElementById("recherche").value.trim().toLowerCase();
-  const t = selType.value, m = selMois.value, com = communesChoisies();
-  return marqueurs.filter(x => {
-    const p = x._p;
-    return (ignorerClasse || actives.has(p.classe)) &&
-      (!t || p.type === t) && (!m || p.mois === m) && com.has(p.commune) &&
-      (!q || (p.adresse||"").toLowerCase().includes(q) ||
-             (p.commune||"").toLowerCase().includes(q));
-  });
-}
-
-function rafraichir(){
-  const gardes = retenus(false);
+function dessiner() {
   groupe.clearLayers();
-  groupe.addLayers(gardes);
-  const n = gardes.length, fg = gardes.filter(x => "FG".includes(x._p.classe)).length;
-  document.getElementById("total").innerHTML = n.toLocaleString("fr-FR") + ' <span>DPE</span>';
-  document.getElementById("pct").textContent = n ? Math.round(100*fg/n) + " %" : "—";
-  if (n) carte.fitBounds(L.featureGroup(gardes).getBounds().pad(.08), {maxZoom:16});
-
-  const base = retenus(true);
-  const max = Math.max(1, ...CLASSES.map(c => base.filter(x=>x._p.classe===c).length));
-  CLASSES.forEach(c => {
-    const nb = base.filter(x=>x._p.classe===c).length;
-    const b = document.querySelector(`.barre[data-c="${c}"]`);
-    b.querySelector(".jauge").style.width = (34 + 66*nb/max) + "%";
-    b.querySelector(".nb").textContent = nb.toLocaleString("fr-FR");
+  const visibles = POINTS.filter(p => actifs.has(p.c));
+  visibles.forEach(p => {
+    L.circleMarker([p.lat, p.lon], {
+      radius: 7, weight: 1.5, color: '#333', opacity: .75,
+      fillColor: COULEURS[p.c] || '#bbb', fillOpacity: .9
+    }).bindPopup(contenu(p)).addTo(groupe);
   });
+  if (visibles.length) {
+    carte.fitBounds(L.latLngBounds(visibles.map(p => [p.lat, p.lon])).pad(0.08));
+  }
 }
 
-const echelle = document.getElementById("echelle");
-CLASSES.forEach(c => {
-  const b = document.createElement("button");
-  b.className = "barre"; b.dataset.c = c; b.setAttribute("aria-pressed","true");
-  b.innerHTML = `<span class="jauge" style="background:${COULEUR[c]}">${c}</span><span class="nb"></span>`;
-  b.onclick = () => {
-    const on = b.getAttribute("aria-pressed") === "true";
-    b.setAttribute("aria-pressed", String(!on));
-    on ? actives.delete(c) : actives.add(c);
-    rafraichir();
-  };
-  echelle.appendChild(b);
+const barre = document.getElementById('filtres');
+Object.keys(COULEURS).forEach(c => {
+  const b = document.createElement('button');
+  b.textContent = c;
+  b.style.background = COULEURS[c];
+  b.onclick = () => { actifs.has(c) ? actifs.delete(c) : actifs.add(c);
+                      b.classList.toggle('off'); dessiner(); };
+  barre.appendChild(b);
 });
 
-selType.onchange = selMois.onchange = selCom.onchange = rafraichir;
-let minuteur;
-document.getElementById("recherche").oninput = () => {
-  clearTimeout(minuteur); minuteur = setTimeout(rafraichir, 250);
-};
-document.getElementById("raz").onclick = () => {
-  CLASSES.forEach(c => { actives.add(c);
-    document.querySelector(`.barre[data-c="${c}"]`).setAttribute("aria-pressed","true"); });
-  selType.value = ""; selMois.value = "";
-  [...selCom.options].forEach(o => o.selected = true);
-  document.getElementById("recherche").value = "";
-  rafraichir();
-};
-
-rafraichir();
+carte.addLayer(groupe);
+if (POINTS.length) { dessiner(); } else { carte.setView([45.83, 1.26], 11); }
 </script>
 </body>
 </html>
 """
 
 
-def ecrire_carte(geo, dossier, titre, depuis):
-    charge = json.dumps(geo, ensure_ascii=False, separators=(",", ":"))
-    with open(os.path.join(dossier, "data.js"), "w", encoding="utf-8") as f:
-        f.write("window.DPE_DATA=" + charge + ";")
-    with open(os.path.join(dossier, "dpe.geojson"), "w", encoding="utf-8") as f:
-        f.write(charge)
-
-    html = (GABARIT
-            .replace("__TITRE__", titre)
-            .replace("__DEPUIS__", fr(depuis))
-            .replace("__EXTRAIT__", date.today().strftime("%d/%m/%Y"))
-            .replace("__COULEURS__", json.dumps(COULEURS, ensure_ascii=False)))
-    with open(os.path.join(dossier, "carte.html"), "w", encoding="utf-8") as f:
+def ecrire_carte(points: List[Dict[str, Any]], chemin: str, titre: str, meta: str) -> None:
+    html = (
+        GABARIT.replace("__DONNEES__", json.dumps(points, ensure_ascii=False))
+        .replace("__COULEURS__", json.dumps(COULEURS))
+        .replace("__TITRE__", titre)
+        .replace("__META__", meta)
+    )
+    with open(chemin, "w", encoding="utf-8") as f:
         f.write(html)
+    log.info("%s points cartographiés dans %s", len(points), chemin)
 
 
-# ---------------------------------------------------------------------- main
+def main(argv: Optional[List[str]] = None) -> int:
+    p = argparse.ArgumentParser(description="Extraction DPE ADEME et carte")
+    p.add_argument("--codes", default="codes-postaux.txt")
+    p.add_argument("--depuis", default="2026-01-01", help="date AAAA-MM-JJ")
+    p.add_argument("--csv", default="dpe.csv")
+    p.add_argument("--carte", default="carte.html")
+    p.add_argument("--taille-page", type=int, default=200)
+    p.add_argument("--pause", type=float, default=0.4)
+    p.add_argument("--diagnostic", action="store_true",
+                   help="teste l'accès à l'API puis s'arrête")
+    args = p.parse_args(argv)
 
-def main():
-    ap = argparse.ArgumentParser(description="Carte des DPE ADEME par codes postaux")
-    ap.add_argument("--cp", required=True,
-                    help="codes postaux séparés par des virgules, ou chemin "
-                         "d'un fichier contenant un code par ligne")
-    ap.add_argument("--depuis", default="2026-01-01",
-                    help="date minimale du DPE (AAAA-MM-JJ), défaut 2026-01-01")
-    ap.add_argument("--out", default="sortie", help="dossier de sortie")
-    ap.add_argument("--dataset", default=DATASET,
-                    help="identifiant du jeu de données ADEME")
-    ap.add_argument("--titre", default="Haute-Vienne", help="titre de la carte")
-    ap.add_argument("--url-publique", default="",
-                    help="URL publique du dossier de sortie (ex. "
-                         "https://moncompte.github.io/dpe/) — génère en plus "
-                         "un carte.umap prêt à importer dans uMap")
-    args = ap.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(levelname)-7s %(message)s",
+                        stream=sys.stdout, force=True)
 
-    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", args.depuis):
-        raise SystemExit("--depuis attend une date au format AAAA-MM-JJ")
-    os.makedirs(args.out, exist_ok=True)
+    client = ClientDPE(taille_page=args.taille_page, pause=args.pause)
 
-    codes = lire_codes_postaux(args.cp)
-    print(f"{len(codes)} codes postaux · DPE depuis le {fr(args.depuis)}")
+    if args.diagnostic:
+        ok = client.diagnostic()
+        print("\n→ au moins une requête aboutit, l'extraction est possible"
+              if ok else
+              "\n→ toutes les requêtes sont refusées : l'IP du runner est filtrée,"
+              " il faut une clé d'API ADEME ou un runner self-hosted")
+        return 0 if ok else 1
 
-    print("Test de l'accès à l'API…")
-    try:
-        sonde = http_json(f"{API}/{args.dataset}/lines?size=1")
-        print(f"  accès accepté ({sonde.get('total', '?')} DPE dans le jeu "
-              f"de données)")
-    except ErreurAPI as e:
-        raise SystemExit(
-            f"L'API ADEME refuse même une requête minimale.\n{e}\n\n"
-            f"Ouvrez cette adresse dans un navigateur pour comparer :\n"
-            f"  {API}/{args.dataset}/lines?size=1\n"
-            f"Si elle s'affiche chez vous, c'est l'adresse IP du serveur "
-            f"GitHub qui est filtrée : lancez le script depuis votre poste.")
+    codes = charger_codes_postaux(args.codes)
+    if not codes:
+        log.error("aucun code postal dans %s", args.codes)
+        return 1
 
-    print("Lecture du schéma ADEME…")
-    champs = mapper_champs(charger_schema(args.dataset))
-    print("  colonnes retenues : " +
-          ", ".join(f"{k}={v}" for k, v in champs.items() if v))
-    if not champs.get("type"):
-        print("  ! type de bâtiment absent du schéma : colonne 'type' vide",
-              file=sys.stderr)
-
-    lignes = []
-    for cp in codes:
-        lignes += extraire(cp, args.depuis, champs, args.dataset)
-
+    log.info("%s codes postaux · DPE depuis le %s", len(codes), args.depuis)
+    lignes = client.recuperer_plusieurs(codes, depuis=args.depuis)
     if not lignes:
-        raise SystemExit(
-            "Aucun DPE trouvé pour ces codes postaux depuis le "
-            f"{fr(args.depuis)}. Vérifiez la date et les codes postaux, ou "
-            f"testez un code seul : --cp \"87000\" --depuis 2021-07-01")
+        log.error("aucun DPE récupéré")
+        return 1
 
-    geo = en_geojson(lignes, champs)
-    ecrire_carte(geo, args.out, args.titre, args.depuis)
-    ecrire_csv(geo["features"], os.path.join(args.out, "dpe.csv"))
-    calques = ecrire_mymaps(geo, args.out)
-    umap = ecrire_couches_umap(geo, args.out, args.url_publique, args.depuis, args.titre)
+    ecrire_csv(lignes, args.csv)
+    points = preparer_points(lignes)
+    meta = (f"{len(lignes)} DPE depuis le {args.depuis[8:10]}/{args.depuis[5:7]}/"
+            f"{args.depuis[0:4]} · maj {date.today().strftime('%d/%m/%Y')}")
+    ecrire_carte(points, args.carte, "DPE récents", meta)
 
-    n = len(geo["features"])
-    fg = sum(1 for f in geo["features"] if f["properties"]["classe"] in ("F", "G"))
-    print(f"\n{n} DPE cartographiés, dont {fg} en F ou G "
-          f"({round(100*fg/n) if n else 0} %).")
-
-    par_commune = grouper(geo["features"], "commune")
-    print(f"\n{len(par_commune)} communes :")
-    for commune, lot in sorted(par_commune.items(), key=lambda x: -len(x[1])):
-        detail = ", ".join(f"{len(v)} {k.lower()}"
-                           for k, v in sorted(grouper(lot, "type").items()))
-        print(f"    {commune:<26} {len(lot):>5}   ({detail})")
-
-    print(f"\nCarte locale          : {os.path.join(args.out, 'carte.html')}")
-    print(f"Tableur               : {os.path.join(args.out, 'dpe.csv')}")
-    print(f"Calques My Maps       : {len(calques)} fichiers dans google-my-maps/")
-    if umap:
-        print(f"Carte uMap à importer : {umap}")
-    else:
-        print("Ajoutez --url-publique pour générer le fichier carte.umap.")
+    repartition: Dict[str, int] = {}
+    for l in lignes:
+        c = (l.get(CHAMPS["classe"]) or "?").strip().upper()[:1] or "?"
+        repartition[c] = repartition.get(c, 0) + 1
+    print("\nRépartition : " + "  ".join(
+        f"{c}={repartition[c]}" for c in sorted(repartition)))
+    print(f"{len(lignes)} DPE · {len(points)} géolocalisés → {args.csv}, {args.carte}")
+    return 0
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except SystemExit:
-        raise
-    except Exception:
-        import traceback
-        print("\n--- Erreur inattendue ---", file=sys.stderr)
-        traceback.print_exc()
-        print("\nCopiez ces lignes pour diagnostic.", file=sys.stderr)
-        sys.exit(1)
+    sys.exit(main())
