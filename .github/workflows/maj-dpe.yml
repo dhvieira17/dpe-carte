@@ -3,7 +3,7 @@ name: Carte DPE
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 6 * * 1"   # tous les lundis à 6h UTC
+    - cron: "0 6 * * 1"   # tous les lundis a 6h UTC
 
 permissions:
   contents: write
@@ -28,7 +28,7 @@ jobs:
         continue-on-error: true
         run: python dpe_carte.py --diagnostic
 
-      - name: Extraction et carte
+      - name: Extraction, carte et exports uMap
         run: python dpe_carte.py --codes codes-postaux.txt --depuis 2026-01-01
 
       - name: Artefacts
@@ -38,11 +38,13 @@ jobs:
           path: |
             dpe.csv
             carte.html
+            dpe.geojson
+            dpe.umap
 
       - name: Publication dans le depot
         run: |
           git config user.name "github-actions"
           git config user.email "actions@github.com"
-          git add -f dpe.csv carte.html
+          git add -f dpe.csv carte.html dpe.geojson dpe.umap
           git diff --staged --quiet || git commit -m "maj DPE $(date +%F)"
           git push
