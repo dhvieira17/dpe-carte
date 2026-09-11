@@ -1,22 +1,19 @@
-name: Mise à jour de la carte DPE
+name: Carte DPE
 
 on:
+  workflow_dispatch:
   schedule:
-    - cron: "0 5 * * *"      # tous les jours à 7h (heure de Paris, été)
-  workflow_dispatch:          # bouton "Run workflow" pour relancer à la main
+    - cron: "0 6 * * 1"   # tous les lundis à 6h UTC
 
 permissions:
-  contents: read
-  pages: write
-  id-token: write
-
-concurrency:
-  group: pages
-  cancel-in-progress: true
+  contents: write
 
 jobs:
-  carte:
+  extraction:
     runs-on: ubuntu-latest
+    env:
+      PYTHONUNBUFFERED: "1"
+      ADEME_API_KEY: ${{ secrets.ADEME_API_KEY }}
     steps:
       - uses: actions/checkout@v4
 
@@ -24,22 +21,28 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Extraire les DPE et générer la carte
-        run: |
-          name: Diagnostic ADEME
-        env:
-          PYTHONUNBUFFERED: "1"
-        run: python dpe_ademe.py --diagnostic
-            --cp codes-postaux.txt \
-            --depuis 2026-01-01 \
-            --titre "Haute-Vienne" \
-            --url-publique "https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/" \
-            --out site
-          cp site/carte.html site/index.html
+      - name: Dependances
+        run: pip install -r requirements.txt
 
-      - uses: actions/upload-pages-artifact@v3
+      - name: Diagnostic API ADEME
+        continue-on-error: true
+        run: python dpe_carte.py --diagnostic
+
+      - name: Extraction et carte
+        run: python dpe_carte.py --codes codes-postaux.txt --depuis 2026-01-01
+
+      - name: Artefacts
+        uses: actions/upload-artifact@v4
         with:
-          path: site
+          name: dpe
+          path: |
+            dpe.csv
+            carte.html
 
-      - id: deploiement
-        uses: actions/deploy-pages@v4
+      - name: Publication dans le depot
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add -f dpe.csv carte.html
+          git diff --staged --quiet || git commit -m "maj DPE $(date +%F)"
+          git push
