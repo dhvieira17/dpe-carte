@@ -267,12 +267,128 @@ def ecrire_carte(points: List[Dict[str, Any]], chemin: str, titre: str, meta: st
     log.info("%s points sur %s communes dans %s", len(points), len(communes), chemin)
 
 
+# --------------------------------------------------------------------------
+# Exports uMap
+# --------------------------------------------------------------------------
+
+GABARIT_POPUP = (
+    "# {name}\n"
+    "{cp} {commune}\n\n"
+    "**DPE {classe}** · GES {ges}\n"
+    "{type} · {surface} m² · {annee}\n"
+    "{conso} kWh/m²/an\n"
+    "DPE du {date} — n° {numero}"
+)
+
+
+def _proprietes(p: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "name": p["a"] or f"DPE {p['n']}",
+        "commune": p["v"],
+        "cp": p["cp"],
+        "mois": p["m"],
+        "date": "/".join(reversed(p["d"].split("-"))) if p["d"] else "",
+        "classe": p["c"],
+        "ges": p["g"],
+        "conso": round(p["co"]) if isinstance(p["co"], (int, float)) else "",
+        "surface": p["s"] if p["s"] is not None else "",
+        "type": p["t"],
+        "annee": p["an"] if p["an"] is not None else "",
+        "numero": p["n"],
+    }
+
+
+def _feature(p: Dict[str, Any], couleur: Optional[str] = None) -> Dict[str, Any]:
+    props = _proprietes(p)
+    if couleur:
+        opts = {"color": couleur, "fillColor": couleur, "iconClass": "Circle"}
+        props["_umap_options"] = opts
+        props["_storage_options"] = opts  # instances uMap antérieures à 2.0
+    return {
+        "type": "Feature",
+        "geometry": {"type": "Point", "coordinates": [p["lon"], p["lat"]]},
+        "properties": props,
+    }
+
+
+def ecrire_geojson(points: List[Dict[str, Any]], chemin: str) -> None:
+    """GeoJSON plat, une seule couche — pour la source distante (remote data)."""
+    communes = palette_communes(points)
+    fc = {
+        "type": "FeatureCollection",
+        "features": [
+            _feature(p, communes.get(p["v"], {}).get("couleur")) for p in points
+        ],
+    }
+    with open(chemin, "w", encoding="utf-8") as f:
+        json.dump(fc, f, ensure_ascii=False)
+    log.info("%s entités écrites dans %s", len(points), chemin)
+
+
+def ecrire_umap(points: List[Dict[str, Any]], chemin: str, titre: str) -> None:
+    """Fichier .umap complet : une couche par commune, prêt à importer."""
+    communes = palette_communes(points)
+    lat = sum(p["lat"] for p in points) / len(points) if points else 45.83
+    lon = sum(p["lon"] for p in points) / len(points) if points else 1.26
+
+    couches = []
+    for nom, info in communes.items():
+        options = {
+            "name": f"{nom} ({info['n']})",
+            "displayOnLoad": True,
+            "browsable": True,
+            "color": info["couleur"],
+            "fillColor": info["couleur"],
+            "iconClass": "Circle",
+            "showLabel": True,
+            "labelKey": "{mois}",
+            "popupShape": "Panel",
+            "popupContentTemplate": GABARIT_POPUP,
+        }
+        couches.append(
+            {
+                "type": "FeatureCollection",
+                "features": [_feature(p) for p in points if p["v"] == nom],
+                "_umap_options": options,
+                "_storage": options,  # instances uMap antérieures à 2.0
+            }
+        )
+
+    carte = {
+        "type": "umap",
+        "uri": "",
+        "properties": {
+            "name": titre,
+            "zoom": 11,
+            "displayPopupFooter": True,
+            "onLoadPanel": "none",
+            "captionBar": False,
+            "licence": "Données ADEME — Observatoire DPE, licence ouverte",
+            "tilelayer": {
+                "name": "OpenStreetMap",
+                "url_template": "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+                "attribution": "© OpenStreetMap contributors",
+                "maxZoom": 19,
+            },
+        },
+        "geometry": {"type": "Point", "coordinates": [lon, lat]},
+        "layers": couches,
+    }
+    with open(chemin, "w", encoding="utf-8") as f:
+        json.dump(carte, f, ensure_ascii=False)
+    log.info("%s couches communales écrites dans %s", len(couches), chemin)
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     p = argparse.ArgumentParser(description="Extraction DPE ADEME et carte")
     p.add_argument("--codes", default="codes-postaux.txt")
     p.add_argument("--depuis", default="2026-01-01", help="date AAAA-MM-JJ")
     p.add_argument("--csv", default="dpe.csv")
     p.add_argument("--carte", default="carte.html")
+    p.add_argument("--geojson", default="dpe.geojson",
+                   help="GeoJSON plat pour la source distante uMap")
+    p.add_argument("--umap", default="dpe.umap",
+                   help="fichier .umap complet, une couche par commune")
     p.add_argument("--taille-page", type=int, default=200)
     p.add_argument("--pause", type=float, default=0.4)
     p.add_argument("--diagnostic", action="store_true",
@@ -308,11 +424,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     meta = (f"{len(lignes)} DPE depuis le {args.depuis[8:10]}/{args.depuis[5:7]}/"
             f"{args.depuis[0:4]} · maj {date.today().strftime('%d/%m/%Y')}")
     ecrire_carte(points, args.carte, "DPE récents", meta)
+    if args.geojson:
+        ecrire_geojson(points, args.geojson)
+    if args.umap:
+        ecrire_umap(points, args.umap, f"DPE récents — {meta}")
 
     comptes = Counter((l.get(CHAMPS["commune"]) or "?").strip() or "?" for l in lignes)
     print("\nPar commune : " + "  ".join(
         f"{v}={n}" for v, n in comptes.most_common(12)))
-    print(f"{len(lignes)} DPE · {len(points)} géolocalisés → {args.csv}, {args.carte}")
+    sorties = [s for s in (args.csv, args.carte, args.geojson, args.umap) if s]
+    print(f"{len(lignes)} DPE · {len(points)} géolocalisés → " + ", ".join(sorties))
     return 0
 
 
