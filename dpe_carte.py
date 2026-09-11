@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """
 dpe_carte.py — extrait les DPE ADEME pour une liste de codes postaux,
-écrit un CSV et génère une carte HTML autonome (Leaflet, aucun dépendance
+écrit un CSV et génère une carte HTML autonome (Leaflet, aucune dépendance
 Python supplémentaire : le rendu se fait côté navigateur via CDN).
+
+Les points sont colorés et filtrés par commune ; chaque point porte une
+étiquette mois/année correspondant à la date d'établissement du DPE.
 
     python dpe_carte.py --diagnostic
     python dpe_carte.py
@@ -15,6 +18,7 @@ import argparse
 import json
 import logging
 import sys
+from collections import Counter
 from datetime import date
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -22,10 +26,19 @@ from dpe_ademe import CHAMPS, ClientDPE, charger_codes_postaux, ecrire_csv
 
 log = logging.getLogger("dpe_carte")
 
-COULEURS = {
+# couleurs officielles des étiquettes DPE (utilisées dans la popup uniquement)
+COULEURS_DPE = {
     "A": "#319834", "B": "#33cc31", "C": "#cbfc34", "D": "#fff32a",
     "E": "#fdd21c", "F": "#f3ac1c", "G": "#ec0000",
 }
+
+# palette de teintes bien distinctes, attribuée commune par commune
+PALETTE = [
+    "#e6194b", "#3cb44b", "#4363d8", "#f58231", "#911eb4", "#008080",
+    "#f032e6", "#9a6324", "#46b1e0", "#808000", "#000075", "#e07b39",
+    "#1abc9c", "#c0392b", "#7d3c98", "#2e86c1", "#ca6f1e", "#17a589",
+    "#884ea0", "#b7950b", "#2874a6", "#cb4335", "#148f77", "#6c3483",
+]
 
 
 def coordonnees(ligne: Dict[str, Any]) -> Optional[Tuple[float, float]]:
@@ -45,6 +58,13 @@ def coordonnees(ligne: Dict[str, Any]) -> Optional[Tuple[float, float]]:
     return None
 
 
+def mois_annee(d: str) -> str:
+    """2026-03-09 -> 03/2026"""
+    if isinstance(d, str) and len(d) >= 7 and d[4] == "-":
+        return f"{d[5:7]}/{d[0:4]}"
+    return ""
+
+
 def preparer_points(lignes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     points, sans_geo = [], 0
     for l in lignes:
@@ -52,17 +72,22 @@ def preparer_points(lignes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if not xy:
             sans_geo += 1
             continue
-        classe = (l.get(CHAMPS["classe"]) or "").strip().upper()[:1]
+        commune = (l.get(CHAMPS["commune"]) or "").strip()
+        cp = str(l.get(CHAMPS["cp"]) or "").strip()
+        if not commune:
+            commune = f"CP {cp}" if cp else "Commune inconnue"
+        d = str(l.get(CHAMPS["date"]) or "")[:10]
         points.append(
             {
                 "lat": round(xy[0], 6),
                 "lon": round(xy[1], 6),
-                "c": classe,
+                "v": commune,
+                "cp": cp,
+                "d": d,
+                "m": mois_annee(d),
+                "c": (l.get(CHAMPS["classe"]) or "").strip().upper()[:1],
                 "g": (l.get(CHAMPS["ges"]) or "").strip().upper()[:1],
                 "a": l.get(CHAMPS["adresse"]) or "",
-                "v": l.get(CHAMPS["commune"]) or "",
-                "cp": l.get(CHAMPS["cp"]) or "",
-                "d": (l.get(CHAMPS["date"]) or "")[:10],
                 "s": l.get(CHAMPS["surface"]),
                 "t": l.get(CHAMPS["type"]) or "",
                 "an": l.get(CHAMPS["annee"]),
@@ -73,6 +98,16 @@ def preparer_points(lignes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     if sans_geo:
         log.warning("%s DPE sans coordonnées, absents de la carte", sans_geo)
     return points
+
+
+def palette_communes(points: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """Une couleur par commune, les communes les plus fournies d'abord."""
+    comptes = Counter(p["v"] for p in points)
+    ordre = sorted(comptes, key=lambda v: (-comptes[v], v))
+    return {
+        v: {"couleur": PALETTE[i % len(PALETTE)], "n": comptes[v]}
+        for i, v in enumerate(ordre)
+    }
 
 
 GABARIT = """<!DOCTYPE html>
@@ -89,13 +124,25 @@ GABARIT = """<!DOCTYPE html>
   #carte{height:100%}
   .panneau{position:absolute;top:12px;right:12px;z-index:1000;background:#fff;
     padding:12px 14px;border-radius:10px;box-shadow:0 2px 12px rgba(0,0,0,.18);
-    font-size:13px;max-width:230px}
-  .panneau h1{font-size:14px;margin:0 0 6px}
-  .panneau .meta{color:#666;font-size:12px;margin-bottom:10px}
-  .filtres{display:flex;flex-wrap:wrap;gap:5px}
-  .filtres button{border:1px solid #ddd;border-radius:6px;width:30px;height:30px;
-    font-weight:700;cursor:pointer;color:#222}
-  .filtres button.off{opacity:.28}
+    font-size:13px;width:240px;max-height:calc(100% - 40px);display:flex;flex-direction:column}
+  .panneau h1{font-size:14px;margin:0 0 4px}
+  .panneau .meta{color:#666;font-size:12px;margin-bottom:8px}
+  .outils{display:flex;gap:6px;margin-bottom:8px}
+  .outils button{flex:1;border:1px solid #ddd;background:#f7f7f7;border-radius:6px;
+    padding:4px 0;font-size:12px;cursor:pointer}
+  .communes{overflow-y:auto;margin:0 -4px;padding:0 4px}
+  .commune{display:flex;align-items:center;gap:7px;padding:3px 4px;border-radius:6px;
+    cursor:pointer;user-select:none}
+  .commune:hover{background:#f4f4f4}
+  .commune.off{opacity:.34}
+  .puce{width:13px;height:13px;border-radius:50%;flex:none;border:1px solid rgba(0,0,0,.25)}
+  .nom{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .nb{color:#888;font-size:11px}
+  .bascule{display:flex;align-items:center;gap:6px;margin-top:9px;
+    border-top:1px solid #eee;padding-top:8px;font-size:12px;color:#444;cursor:pointer}
+  .etq{background:rgba(255,255,255,.92);border:1px solid #bbb;border-radius:4px;
+    padding:0 4px;font-size:10px;font-weight:600;color:#222;box-shadow:none;white-space:nowrap}
+  .etq:before{display:none}
   .popup b{font-size:13px}
   .popup table{border-collapse:collapse;margin-top:6px;font-size:12px}
   .popup td{padding:1px 8px 1px 0;vertical-align:top}
@@ -108,64 +155,98 @@ GABARIT = """<!DOCTYPE html>
 <div class="panneau">
   <h1>__TITRE__</h1>
   <div class="meta">__META__</div>
-  <div class="filtres" id="filtres"></div>
+  <div class="outils">
+    <button id="tout">Tout</button>
+    <button id="rien">Aucune</button>
+  </div>
+  <div class="communes" id="communes"></div>
+  <label class="bascule"><input type="checkbox" id="etiquettes" checked> Étiquettes mois/année</label>
 </div>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
 <script>
 const POINTS = __DONNEES__;
-const COULEURS = __COULEURS__;
+const COMMUNES = __COMMUNES__;      // { nom: {couleur, n} }
+const COULEURS_DPE = __COULEURS_DPE__;
+
 const carte = L.map('carte');
 L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-  maxZoom: 19, attribution: '© OpenStreetMap — données ADEME'
+  maxZoom: 19, attribution: '&copy; OpenStreetMap &mdash; donnees ADEME'
 }).addTo(carte);
 
-const actifs = new Set(Object.keys(COULEURS).concat(['']));
-const groupe = L.markerClusterGroup({ maxClusterRadius: 45, disableClusteringAtZoom: 17 });
+const actifs = new Set(Object.keys(COMMUNES));
+const groupe = L.markerClusterGroup({ maxClusterRadius: 45, disableClusteringAtZoom: 16 });
+carte.addLayer(groupe);
+
+function couleur(p) { return (COMMUNES[p.v] || {}).couleur || '#888'; }
 
 function contenu(p) {
   const l = [];
   if (p.t) l.push(['Type', p.t]);
-  if (p.s) l.push(['Surface', p.s + ' m²']);
+  if (p.s) l.push(['Surface', p.s + ' m2']);
   if (p.an) l.push(['Construction', p.an]);
-  if (p.co) l.push(['Conso', Math.round(p.co) + ' kWh/m²/an']);
+  if (p.co) l.push(['Conso', Math.round(p.co) + ' kWh/m2/an']);
   if (p.g) l.push(['GES', p.g]);
   if (p.d) l.push(['DPE du', p.d.split('-').reverse().join('/')]);
-  if (p.n) l.push(['N°', p.n]);
+  if (p.n) l.push(['No', p.n]);
   return '<div class="popup"><b>' + (p.a || 'Adresse inconnue') + '</b><br>'
     + p.cp + ' ' + p.v + '<br>'
-    + '<span class="pastille" style="background:' + (COULEURS[p.c] || '#bbb') + '">'
-    + (p.c || '?') + '</span>'
+    + (p.c ? '<span class="pastille" style="background:' + (COULEURS_DPE[p.c] || '#bbb')
+             + '">' + p.c + '</span>' : '')
     + '<table>' + l.map(x => '<tr><td>' + x[0] + '</td><td>' + x[1] + '</td></tr>').join('')
     + '</table></div>';
 }
 
-function dessiner() {
+function dessiner(recadrer) {
+  const avecEtq = document.getElementById('etiquettes').checked;
   groupe.clearLayers();
-  const visibles = POINTS.filter(p => actifs.has(p.c));
-  visibles.forEach(p => {
-    L.circleMarker([p.lat, p.lon], {
+  const visibles = POINTS.filter(p => actifs.has(p.v));
+  const marqueurs = visibles.map(p => {
+    const m = L.circleMarker([p.lat, p.lon], {
       radius: 7, weight: 1.5, color: '#333', opacity: .75,
-      fillColor: COULEURS[p.c] || '#bbb', fillOpacity: .9
-    }).bindPopup(contenu(p)).addTo(groupe);
+      fillColor: couleur(p), fillOpacity: .9
+    }).bindPopup(contenu(p));
+    if (avecEtq && p.m) {
+      m.bindTooltip(p.m, { permanent: true, direction: 'top',
+                           className: 'etq', offset: [0, -7] });
+    }
+    return m;
   });
-  if (visibles.length) {
+  groupe.addLayers(marqueurs);
+  if (recadrer && visibles.length) {
     carte.fitBounds(L.latLngBounds(visibles.map(p => [p.lat, p.lon])).pad(0.08));
   }
 }
 
-const barre = document.getElementById('filtres');
-Object.keys(COULEURS).forEach(c => {
-  const b = document.createElement('button');
-  b.textContent = c;
-  b.style.background = COULEURS[c];
-  b.onclick = () => { actifs.has(c) ? actifs.delete(c) : actifs.add(c);
-                      b.classList.toggle('off'); dessiner(); };
-  barre.appendChild(b);
+const liste = document.getElementById('communes');
+const rangees = {};
+Object.keys(COMMUNES).forEach(function (nom) {
+  const d = document.createElement('div');
+  d.className = 'commune';
+  d.innerHTML = '<span class="puce" style="background:' + COMMUNES[nom].couleur + '"></span>'
+    + '<span class="nom" title="' + nom + '">' + nom + '</span>'
+    + '<span class="nb">' + COMMUNES[nom].n + '</span>';
+  d.onclick = function () {
+    if (actifs.has(nom)) { actifs.delete(nom); } else { actifs.add(nom); }
+    d.classList.toggle('off');
+    dessiner(false);
+  };
+  rangees[nom] = d;
+  liste.appendChild(d);
 });
 
-carte.addLayer(groupe);
-if (POINTS.length) { dessiner(); } else { carte.setView([45.83, 1.26], 11); }
+function basculerTout(on) {
+  Object.keys(COMMUNES).forEach(function (nom) {
+    if (on) { actifs.add(nom); rangees[nom].classList.remove('off'); }
+    else { actifs.delete(nom); rangees[nom].classList.add('off'); }
+  });
+  dessiner(on);
+}
+document.getElementById('tout').onclick = function () { basculerTout(true); };
+document.getElementById('rien').onclick = function () { basculerTout(false); };
+document.getElementById('etiquettes').onchange = function () { dessiner(false); };
+
+if (POINTS.length) { dessiner(true); } else { carte.setView([45.83, 1.26], 11); }
 </script>
 </body>
 </html>
@@ -173,15 +254,17 @@ if (POINTS.length) { dessiner(); } else { carte.setView([45.83, 1.26], 11); }
 
 
 def ecrire_carte(points: List[Dict[str, Any]], chemin: str, titre: str, meta: str) -> None:
+    communes = palette_communes(points)
     html = (
         GABARIT.replace("__DONNEES__", json.dumps(points, ensure_ascii=False))
-        .replace("__COULEURS__", json.dumps(COULEURS))
+        .replace("__COMMUNES__", json.dumps(communes, ensure_ascii=False))
+        .replace("__COULEURS_DPE__", json.dumps(COULEURS_DPE))
         .replace("__TITRE__", titre)
         .replace("__META__", meta)
     )
     with open(chemin, "w", encoding="utf-8") as f:
         f.write(html)
-    log.info("%s points cartographiés dans %s", len(points), chemin)
+    log.info("%s points sur %s communes dans %s", len(points), len(communes), chemin)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -226,12 +309,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             f"{args.depuis[0:4]} · maj {date.today().strftime('%d/%m/%Y')}")
     ecrire_carte(points, args.carte, "DPE récents", meta)
 
-    repartition: Dict[str, int] = {}
-    for l in lignes:
-        c = (l.get(CHAMPS["classe"]) or "?").strip().upper()[:1] or "?"
-        repartition[c] = repartition.get(c, 0) + 1
-    print("\nRépartition : " + "  ".join(
-        f"{c}={repartition[c]}" for c in sorted(repartition)))
+    comptes = Counter((l.get(CHAMPS["commune"]) or "?").strip() or "?" for l in lignes)
+    print("\nPar commune : " + "  ".join(
+        f"{v}={n}" for v, n in comptes.most_common(12)))
     print(f"{len(lignes)} DPE · {len(points)} géolocalisés → {args.csv}, {args.carte}")
     return 0
 
